@@ -989,6 +989,13 @@ static int do_recv(int f_in, int f_out, char *local_name)
 
 	generate_files(f_out, local_name);
 
+	extern int checksumcache_found;
+  if (!checksumcache_found && !am_receiver) {
+    rprintf(FINFO, "generate_files: done, saving checksum\n");
+    extern const char *checksumcache_file;
+    checksumcache_save(checksumcache_file);
+  }
+
 	handle_stats(-1);
 	io_flush(FULL_FLUSH);
 	shutting_down = True;
@@ -1025,6 +1032,22 @@ static void do_server_recv(int f_in, int f_out, int argc, char *argv[])
 		rprintf(FERROR,"ERROR: module is read only\n");
 		exit_cleanup(RERR_SYNTAX);
 		return;
+	}
+
+	// Only receiver loads cache
+	if (!am_sender) {
+		struct stat statbuf;
+		extern const char *checksumcache_file;
+		extern int checksumcache_found;
+		int ret = stat(checksumcache_file, &statbuf);
+		if (ret >= 0) {
+			checksumcache_found = 1;
+			checksumcache_load(checksumcache_file);
+		} else if (errno == ENOENT) {
+			checksumcache_found = 0;
+		} else {
+			rprintf(FERROR, "Failed to load checksum file: error: %s\n", strerror(errno));
+		}
 	}
 
 	if (argc > 0) {

@@ -190,6 +190,91 @@ void get_checksum2(char *buf, int32 len, char *sum)
 	}
 }
 
+#include "uthash.h"
+extern int am_sender;
+#define MD5_HASH_BYTES 16
+struct my_struct {
+	char filepath[256];
+	char md5[MD5_HASH_BYTES];
+	UT_hash_handle hh; /* makes this structure hashable */
+};
+struct my_struct *checksum_table = NULL;
+int checksumcache_found = 0;
+const char *checksumcache_file = "/tmp/rsync.checksum";
+
+void checksumcache_save(const char *filename)
+{
+	if (am_sender)
+		return;
+	int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		rprintf(FERROR, "Failed to save checksumcache to file %s\n", filename);
+		abort();
+	}
+	int n = 0;
+	for (struct my_struct *s = checksum_table; s != NULL; s = s->hh.next) {
+		write(fd, s->filepath, sizeof(s->filepath));
+		write(fd, s->md5, sizeof(s->md5));
+		n++;
+	}
+	close(fd);
+	rprintf(FINFO, "save %d files in checksum cache\n", n);
+}
+
+void checksumcache_load(const char *filename)
+{
+	int fd = open(filename, O_RDONLY);
+	if (fd < 0) {
+		rprintf(FERROR, "Failed to load checksumcache from file %s\n", filename);
+		abort();
+	}
+	int count = 0;
+	while (1) {
+		struct my_struct *ps = (struct my_struct*)malloc(sizeof(struct my_struct));
+		int nread = read(fd, ps->filepath, sizeof(ps->filepath));
+		if (nread < 0) {
+			abort();
+		}
+		nread = read(fd, ps->md5, sizeof(ps->md5));
+		if (nread == 0) {
+			break;
+		} else if (nread < 0) {
+			abort();
+		}
+		HASH_ADD_STR(checksum_table, filepath, ps);
+		count++;
+	}
+	struct my_struct *s;
+	HASH_FIND_STR(checksum_table, "a", s);
+//	rprintf(FINFO, "Load %d items from checksum cache\n", count);
+	close(fd);
+}
+
+int checksumcache_get_for_file(const char *fname, char *sum)
+{
+	struct my_struct *s;
+	HASH_FIND_STR(checksum_table, fname, s);
+	if (!s) {
+//		rprintf(FINFO, "file does not exist in checksum table %s\n", fname);
+		return 1;
+	}
+	memcpy(sum, s->md5, sizeof(s->md5));
+//	rprintf(FINFO, "checksum cache hit %s\n", fname);
+	return 0;
+}
+
+int checksumcache_put_for_file(const char *fname, const char *sum)
+{
+	struct my_struct *ps = (struct my_struct*)calloc(1, sizeof(struct my_struct));
+	strcpy(ps->filepath, fname);
+	memcpy(ps->md5, sum, sizeof(ps->md5));
+	HASH_ADD_STR(checksum_table, filepath, ps);
+	int n = HASH_COUNT(checksum_table);
+	rprintf(FWARNING, "checksumcache_put_for_file %s, total %d\n", fname, n);
+
+	return 0;
+}
+
 void file_checksum(const char *fname, const STRUCT_STAT *st_p, char *sum)
 {
 	struct map_struct *buf;
@@ -208,6 +293,14 @@ void file_checksum(const char *fname, const STRUCT_STAT *st_p, char *sum)
 
 	switch (checksum_type) {
 	  case CSUM_MD5:
+    // only use cache MD5s in the receiver's side and when cache loaded
+    if (!am_sender &&
+        (checksum_table != NULL) &&
+        (checksumcache_get_for_file(fname, sum) == 0)) {
+      // success
+      break;
+    }
+
 		md5_begin(&m);
 
 		for (i = 0; i + CSUM_CHUNK <= len; i += CSUM_CHUNK) {
@@ -220,6 +313,12 @@ void file_checksum(const char *fname, const STRUCT_STAT *st_p, char *sum)
 			md5_update(&m, (uchar *)map_ptr(buf, i, remainder), remainder);
 
 		md5_result(&m, (uchar *)sum);
+		rprintf(FERROR, "put md5 for file %s, am_sender %d\n", fname, am_sender);
+		// Only sender put cache
+    if (am_sender && checksumcache_put_for_file(fname, sum) != 0) {
+      rprintf(FERROR, "failed to put md5 cache\n");
+      abort();
+    }
 		break;
 	  case CSUM_MD4:
 	  case CSUM_MD4_OLD:
